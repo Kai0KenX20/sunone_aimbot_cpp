@@ -419,7 +419,8 @@ void TrtDetector::processFrame(const cv::Mat& frame)
     }
 
     std::unique_lock<std::mutex> lock(inferenceMutex);
-    currentFrame = frame.clone();
+    // Avoid deep copy; share data buffer and move later in inference thread
+    currentFrame = frame;
     frameReady = true;
     inferenceCV.notify_one();
 }

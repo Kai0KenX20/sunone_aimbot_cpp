@@ -9,6 +9,8 @@
 #include <atomic>
 #include <chrono>
 #include <dxgi.h>
+// Preprocessing optimizations
+#include <opencv2/dnn.hpp>
 
 #include "dml_detector.h"
 #include "sunone_aimbot_cpp.h"
@@ -52,6 +54,7 @@ DirectMLDetector::DirectMLDetector(const std::string& model_path)
         std::cout << "[DirectML] Using adapter: " << GetDMLDeviceName(config.dml_device_id) << std::endl;
 
     session_options.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
+    session_options.SetGraphOptimizationLevel(Ort::GraphOptimizationLevel::ORT_ENABLE_ALL);
     session_options.SetIntraOpNumThreads(std::thread::hardware_concurrency());
 
     initializeModel(model_path);
@@ -112,29 +115,17 @@ std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vec
     const int target_w = useFixed ? model_w : config.detection_resolution;
 
     auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> input_tensor_values(batch_size * 3 * target_h * target_w);
-
-    for (int b = 0; b < batch_size; ++b)
-    {
-        cv::Mat resized;
-        cv::resize(frames[b], resized, cv::Size(target_w, target_h));
-        cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
-        resized.convertTo(resized, CV_32FC3, 1.0f / 255.0f);
-
-        const float* src = reinterpret_cast<const float*>(resized.data);
-        for (int h = 0; h < target_h; ++h)
-            for (int w = 0; w < target_w; ++w)
-                for (int c = 0; c < 3; ++c)
-                {
-                    size_t dstIdx = b * 3 * target_h * target_w + c * target_h * target_w + h * target_w + w;
-                    input_tensor_values[dstIdx] = src[(h * target_w + w) * 3 + c];
-                }
-    }
+    // Use OpenCV to construct a contiguous NCHW float blob for the batch in one pass
+    cv::Mat blob;
+    // scaleFactor=1/255, size=(target_w,target_h), mean=0, swapRB=true (BGR->RGB), crop=false, ddepth=CV_32F
+    cv::dnn::blobFromImages(frames, blob, 1.0 / 255.0, cv::Size(target_w, target_h), cv::Scalar(), true, false, CV_32F);
     auto t1 = std::chrono::steady_clock::now();
 
     std::vector<int64_t> ort_input_shape{ batch_size, 3, target_h, target_w };
     Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        memory_info, input_tensor_values.data(), input_tensor_values.size(),
+        memory_info,
+        reinterpret_cast<float*>(blob.data),
+        static_cast<size_t>(blob.total()),
         ort_input_shape.data(), ort_input_shape.size());
 
     const char* input_names[] = { input_name.c_str() };
@@ -223,7 +214,8 @@ int DirectMLDetector::getNumberOfClasses()
 void DirectMLDetector::processFrame(const cv::Mat& frame)
 {
     std::unique_lock<std::mutex> lock(inferenceMutex);
-    currentFrame = frame.clone();
+    // Avoid deep copy; share data buffer and move later in inference thread
+    currentFrame = frame;
     frameReady = true;
     inferenceCV.notify_one();
 }
